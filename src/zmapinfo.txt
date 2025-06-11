@@ -1,0 +1,5 @@
+DoomEdNums {
+  19901 = RopeController
+  19902 = RopeWindController
+  19903 = RopeAttachment
+}

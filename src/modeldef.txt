@@ -1,0 +1,23 @@
+model RopeParticle {
+   model 0 "models/rope/rope.obj"
+   skin 0 "models/rope/rope.png"
+   scale 1.0 1.0 1.2
+
+   USEACTORPITCH
+   DONTCULLBACKFACES
+   NOPERPIXELLIGHTING
+
+   FrameIndex ROPE A 0 0
+}
+
+model RopeParticleInteractive {
+   model 0 "models/rope/rope.obj"
+   skin 0 "models/rope/rope.png"
+   scale 1.0 1.0 1.2
+
+   USEACTORPITCH
+   DONTCULLBACKFACES
+   NOPERPIXELLIGHTING
+
+   FrameIndex ROPE A 0 0
+}
