@@ -1,0 +1,7 @@
+server latch int rope_particle_density = 6;
+server latch int rope_mesh_quality = 2;
+
+server noarchive int rope_settle_ticks = 20;
+server noarchive int rope_settle_longer_ticks = 350;
+server noarchive latch int rope_jakobsen_iterations = 6;
+server noarchive latch int rope_dormant_distance = 2048;

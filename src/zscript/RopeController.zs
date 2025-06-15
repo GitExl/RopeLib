@@ -1,10 +1,9 @@
-const ROPE_ITERATIONS = 6;
-
 enum RopeFlags : uint {
-  ROPEF_LOOSE_END      = 0x0001,
-  ROPEF_ALWAYS_ACTIVE  = 0x0002,
-  ROPEF_ANCHOR_END     = 0x0004,
-  ROPEF_INTERACTIVE    = 0x0008,
+  ROPEF_LOOSE_END     = 0x0001,
+  ROPEF_ALWAYS_ACTIVE = 0x0002,
+  ROPEF_ANCHOR_END    = 0x0004,
+  ROPEF_INTERACTIVE   = 0x0008,
+  ROPEF_SETTLE_LONGER = 0x0010,
 }
 
 class RopeController : Actor {
@@ -17,11 +16,6 @@ class RopeController : Actor {
     //$IgnoreRenderstyle
     //$NotAngled
 
-    //$Arg0 "Segments"
-    //$Arg0Type 11
-    //$Arg0Enum {0 = "7 segments"; 1 = "15 segments"; 2 = "23 segments"; 3 = "31 segments";}
-    //$Arg0Tooltip "The number of segments of the rope. More segments look better but perform worse."
-
     //$Arg1 "Start thing"
     //$Arg1Type 14
     //$Arg1Tooltip "The TID of thing to attach the start of the rope to."
@@ -32,7 +26,7 @@ class RopeController : Actor {
 
     //$Arg3 "Flags"
     //$Arg3Type 12
-    //$Arg3Enum {1 = "Loose end"; 2 = "Always active"; 4 = "Anchor end to rope"; 8 = "Interactive";}
+    //$Arg3Enum {1 = "Loose end"; 2 = "Always active"; 4 = "Anchor end to rope"; 8 = "Interactive"; 16 = "Settle longer";}
 
     //$Arg4 "Stiffness"
     //$Arg4Type 0
@@ -61,14 +55,26 @@ class RopeController : Actor {
       stop;
   }
 
+  // Particle actors.
   Array<RopeParticleBase> particles;
-  double desiredSpacing;
+
+  // Desired spacing between particles. The simulation will push particles apart to try to reach this.
+  double desiredParticleSpacing;
+
+  // Wind vector normally set from a RopeWindController actor.
   Vector3 wind;
-  Vector3 bbox1;
-  Vector3 bbox2;
-  Vector3 ropeSleepDistance;
+
+  // If true this rope is not being simulated.
   bool isDormant;
+
+  // How long to wait before updating the dormant state again.
   int dormantCounter;
+
+  // The distance in map units between the rope and a camera, beyond which ropes go dormant. Squared.
+  int dormantDistanceSq;
+
+  // How many Jakobsen iteration to run during the rope simulation.
+  int iterationCount;
 
   override void PostBeginPlay() {
     super.PostBeginPlay();
@@ -85,14 +91,38 @@ class RopeController : Actor {
       return;
     }
 
+    // Determine iteration count from CVar.
+    iterationCount = max(1, min(50, CVar.GetCVar("rope_jakobsen_iterations").GetInt()));
+
+    // Determine mesh quality to use.
+    int meshQuality = max(0, min(2, CVar.GetCVar("rope_mesh_quality").GetInt()));
+    statelabel particleState = "Low";
+    if (meshQuality == 1) {
+      particleState = "Medium";
+    } else if (meshQuality == 2) {
+      particleState = "High";
+    }
+
+    // Calculate squared dormant distance from CVar.
+    dormantDistanceSq = max(128, min(8192, CVar.GetCVar("rope_dormant_distance").GetInt()));
+    dormantDistanceSq = dormantDistanceSq * dormantDistanceSq;
+
     // Toggle between interactive or regular rope particles.
     name particleClass = "RopeParticle";
     if (args[3] & ROPEF_INTERACTIVE) {
       particleClass = "RopeParticleInteractive";
     }
 
-    // Spawn particle actors.
-    int particleCount = 8 + args[0] * 8;
+    // Calculate rope length modifier based on desired stiffness.
+    double stiffness = Double(-args[4]) / 100.0;
+    double ropeLengthModifier = 1.0 + stiffness;
+
+    // Calculate the desired particle count and spacing.
+    double ropeLength = Level.Vec3Diff(end.pos, start.pos).Length() * ropeLengthModifier;
+    int particleDivider = ceil(256.0 / CVar.GetCVar("rope_particle_density").GetInt());
+    int particleCount = 2 + ceil(ropeLength / particleDivider);
+    desiredParticleSpacing = ropeLength / (particleCount - 1);
+
     for (int i = 0; i < particleCount; i++) {
       double w = Double(i) / (particleCount - 1);
 
@@ -116,6 +146,7 @@ class RopeController : Actor {
       p.scale = scale;
       p.alpha = alpha;
       p.SetShade(fillcolor);
+      p.SetState(p.FindState(particleState));
 
       particles.push(p);
     }
@@ -132,26 +163,17 @@ class RopeController : Actor {
     }
     particles[particleCount - 1].A_SetRenderStyle(1.0, STYLE_None);
 
-    // Calculate rope length modifier based on desired stiffness.
-    double stiffness = Double(-args[4]) / 100.0;
-    double ropeLengthModifier = 1.0 + stiffness;
-
-    // Calculate the desired particle spacing.
-    double ropeLength = Level.Vec3Diff(end.pos, start.pos).Length() * ropeLengthModifier;
-    desiredSpacing = ropeLength / (particleCount - 1);
-
     // Track initial dormancy state.
-    ropeSleepDistance = (768, 768, -768);
-    UpdateBBox();
     isDormant = false;
-    dormantCounter = random(1, 50);
+    dormantCounter = random(1, 100);
+
+    Settle();
   }
 
   override void Tick() {
 
     // Go to sleep if there is no camera nearby.
     if (!(args[3] & ROPEF_ALWAYS_ACTIVE) && !dormantCounter--) {
-      UpdateBBox();
       bool shouldBeDormant = !IsCameraNearby();
       if (shouldBeDormant != isDormant) {
         isDormant = shouldBeDormant;
@@ -164,7 +186,7 @@ class RopeController : Actor {
           }
         }
       }
-      dormantCounter = 15;
+      dormantCounter = 20;
     }
 
     if (!isDormant) {
@@ -182,6 +204,15 @@ class RopeController : Actor {
 
     if (!isDormant) {
       UpdateModels();
+    }
+  }
+
+  void Settle() {
+
+    // Simulate the rope for a number of ticks to settle it into a stable position.
+    int iterations = (args[3] & ROPEF_SETTLE_LONGER) ? CVar.GetCVar("rope_settle_longer_ticks").GetInt() : CVar.GetCVar("rope_settle_ticks").GetInt();
+    while (iterations--) {
+      Simulate();
     }
   }
 
@@ -215,7 +246,7 @@ class RopeController : Actor {
     // Enforce constraints between particles.
     double currentSpacing;
     double difference;
-    for (int i = 0; i < ROPE_ITERATIONS; i++) {
+    for (int i = 0; i < iterationCount; i++) {
       for (int j = 0; j < particles.Size() - 1; j++) {
         RopeParticleBase p1 = particles[j];
         RopeParticleBase p2 = particles[j + 1];
@@ -225,7 +256,7 @@ class RopeController : Actor {
 
         // Get the normalized difference between the desired spacing and current spacing.
         // Use that to calculate how far to move the particles together or apart.
-        difference = (desiredSpacing - currentSpacing) / currentSpacing;
+        difference = (desiredParticleSpacing - currentSpacing) / currentSpacing;
         Vector3 delta = p1.nextPos - p2.nextPos;
         delta *= difference;
 
@@ -242,9 +273,9 @@ class RopeController : Actor {
       }
     }
 
-    // Update particle actor positions.
+    // Update particle positions.
     foreach (p : particles) {
-      p.SetOrigin(p.nextPos, true);
+      p.SetXYZ(p.nextPos);
       p.vel = (0, 0, 0);
     }
   }
@@ -267,41 +298,18 @@ class RopeController : Actor {
     }
   }
 
-  void UpdateBBox() {
-    bbox1 = bbox2 = particles[particles.Size() / 2].pos;
-
-    foreach (p : particles) {
-      bbox1.x = min(bbox1.x, p.pos.x);
-      bbox1.y = min(bbox1.y, p.pos.y);
-      bbox1.z = max(bbox1.y, p.pos.z);
-      bbox2.x = max(bbox2.x, p.pos.x);
-      bbox2.y = max(bbox2.y, p.pos.y);
-      bbox2.z = min(bbox2.z, p.pos.z);
-    }
-
-    bbox1 -= ropeSleepDistance;
-    bbox2 += ropeSleepDistance;
-  }
-
   bool IsCameraNearby() {
-
-    // Check for any remote camera for the consoleplayer.
-    if (players[consoleplayer].camera != players[consoleplayer].mo) {
-      Vector3 cam = players[consoleplayer].camera.pos;
-      if (cam.x < bbox1.x || cam.y < bbox1.y || cam.z < bbox1.z || cam.x > bbox2.x || cam.y > bbox2.y || cam.z > bbox2.z) {
-        return false;
+    foreach (p : players) {
+      if (!p.Camera) {
+        continue;
       }
-    }
 
-    // Regular distance check.
-    else {
-      Vector3 size = bbox2 - bbox1;
-      Vector3 center = bbox1 + (size / 2);
-      BlockThingsIterator it = BlockThingsIterator.CreateFromPos(center.x, center.y, center.z, 0.0, max(size.x, size.y, size.z), false);
-      while (it.Next()) {
-        if (it.thing is "PlayerPawn") {
-          return true;
-        }
+      // Test the first and last rope particle.
+      if (p.Camera.Distance3DSquared(particles[0]) < dormantDistanceSq) {
+        return true;
+      }
+      if (p.Camera.Distance3DSquared(particles[particles.Size() - 1]) < dormantDistanceSq) {
+        return true;
       }
     }
 
